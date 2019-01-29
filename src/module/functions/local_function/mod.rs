@@ -97,7 +97,8 @@ impl LocalFunction {
         Ok(func)
     }
 
-    fn alloc<T>(&mut self, val: T) -> T::Id
+    /// Allocate a new expression into this local function's arena
+    pub(crate) fn alloc<T>(&mut self, val: T) -> T::Id
     where
         T: Ast,
     {

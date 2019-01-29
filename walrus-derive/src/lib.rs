@@ -968,9 +968,15 @@ fn create_builder(variants: &[WalrusVariant]) -> impl quote::ToTokens {
             }
         });
     }
+    let builder_methods = &builder_methods;
+
     quote! {
         #[allow(missing_docs)]
         impl crate::FunctionBuilder {
+            #(#builder_methods)*
+        }
+        #[allow(missing_docs)]
+        impl crate::module::functions::LocalFunction {
             #(#builder_methods)*
         }
     }

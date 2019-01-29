@@ -783,6 +783,23 @@ pub struct MemArg {
     pub offset: u32,
 }
 
+impl MemArg {
+    /// Creates a new `MemArg` with zero offset and the specified alignment
+    pub fn new(align: u32) -> MemArg {
+        MemArg { align, offset: 0 }
+    }
+
+    /// Returns a new `MemArg` with the current alignment and the specified offset
+    pub fn with_offset(&self, offset: u32) -> MemArg {
+        MemArg { offset, ..*self }
+    }
+
+    /// Returns a new `MemArg` with the current alignment and the specified align
+    pub fn with_align(&self, align: u32) -> MemArg {
+        MemArg { align, ..*self }
+    }
+}
+
 /// The different kinds of atomic rmw operations
 #[derive(Debug, Copy, Clone)]
 #[allow(missing_docs)]

@@ -33,7 +33,8 @@ pub struct LocalFunction {
     /// The arena that contains this function's expressions.
     pub(crate) exprs: Arena<Expr>,
 
-    args: Vec<LocalId>,
+    /// The locals that the function arguments are initially placed into
+    pub args: Vec<LocalId>,
 
     /// The entry block for this function. Always `Some` after the constructor
     /// returns.

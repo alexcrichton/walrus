@@ -2,14 +2,13 @@
 
 use crate::error::Result;
 use crate::ir::*;
-use crate::map::IdHashMap;
-use crate::module::functions::FunctionId;
-use crate::module::functions::LocalFunction;
+use crate::map::{IdHashMap, IdHashSet};
+use crate::module::functions::{Function, FunctionId, FunctionKind, LocalFunction};
 use crate::module::globals::{Global, GlobalKind};
 use crate::module::locals::ModuleLocals;
 use crate::module::memories::MemoryId;
 use crate::module::{Module, ModuleConfig};
-use crate::ty::ValType;
+use crate::ty::{ValType, TypeId, Type};
 use failure::bail;
 use id_arena::Id;
 use std::cmp;
@@ -24,6 +23,12 @@ pub fn run(module: &mut Module) -> Result<()> {
     // near are not used.
     let memory = module.memories.iter().next().map(|m| m.id());
     let memory = memory.unwrap_or_else(|| module.memories.add_local(false, 1, Some(1)));
+
+    // First up, serially, map all function signatures. Here we'll be modifying
+    // the global registry of types and updating all function signatures all
+    // over the place.
+    analysis.split_function_arguments(module)?;
+
     let locals = &mut module.locals;
     let config = &module.config;
     module.funcs.iter_local_mut().for_each(|(id, func)| {
@@ -38,6 +43,8 @@ pub fn run(module: &mut Module) -> Result<()> {
             replace_with: None,
             id: entry.into(),
             locals,
+            blocks: IdHashMap::default(),
+            config,
         }
         .visit_block_id_mut(&mut entry);
 
@@ -53,8 +60,7 @@ pub fn run(module: &mut Module) -> Result<()> {
             local_halves: IdHashMap::default(),
             memory,
             config,
-        }
-        .visit_block_id_mut(&mut entry);
+        }.visit_block_id_mut(&mut entry);
     });
 
     Ok(())
@@ -63,6 +69,9 @@ pub fn run(module: &mut Module) -> Result<()> {
 #[derive(Default)]
 struct Analysis {
     globals: IdHashMap<Global, Replace<Global>>,
+    arguments: IdHashMap<Local, Replace<Local>>,
+    old_function_types: IdHashMap<Function, TypeId>,
+    old_types_to_new: IdHashMap<Type, TypeId>,
 }
 
 struct Replace<T> {
@@ -78,14 +87,21 @@ impl<T> Clone for Replace<T> {
 impl<T> Copy for Replace<T> {}
 
 impl Analysis {
+    /// Splits all `i64` globals in a module to two `i32` halves, recording
+    /// which is for the high bits and which is for the low bits.
     fn split_globals(&mut self, module: &mut Module) -> Result<()> {
         use crate::const_value::Const;
+
+        let exports = module.exports.globals().collect::<IdHashSet<_>>();
 
         let mut to_split = Vec::new();
         for global in module.globals.iter() {
             match global.ty {
                 ValType::I64 => {}
                 _ => continue,
+            }
+            if exports.contains(&global.id()) {
+                bail!("can't export a 64-bit global");
             }
             let val = match global.kind {
                 GlobalKind::Import(_) | GlobalKind::Local(Const::Global(_)) => {
@@ -110,6 +126,67 @@ impl Analysis {
 
         Ok(())
     }
+
+    /// Fixes all function signatures to not have `i64` arguments.
+    ///
+    /// Arguments of `i64` become two `i32` arguments, and return values become
+    /// `i32` and we'll use a global later to transmit the other 32 bits.
+    fn split_function_arguments(&mut self, module: &mut Module) -> Result<()> {
+        let exports = module.exports.funcs().collect::<IdHashSet<_>>();
+
+        for func in module.funcs.iter_mut() {
+            let id = func.id();
+            self.old_function_types.insert(id, func.ty());
+            let ty = module.types.get(func.ty());
+            if !ty.params().iter().any(|t| *t == ValType::I64)
+                && !ty.results().iter().any(|t| *t == ValType::I64)
+            {
+                continue;
+            }
+            if exports.contains(&id) {
+                bail!("can't export a function which takes or returns i64");
+            }
+
+            let local = match &mut func.kind {
+                FunctionKind::Local(local) => local,
+                _ => {
+                    bail!("cannot import functions which take or return i64");
+                }
+            };
+
+            let mut new_params = Vec::new();
+            let old_locals = mem::replace(&mut local.args, Vec::new());
+            for (arg, ty) in old_locals.into_iter().zip(ty.params()) {
+                if *ty != ValType::I64 {
+                    local.args.push(arg);
+                    new_params.push(*ty);
+                    continue
+                }
+
+                let low = module.locals.add(ValType::I32);
+                let high = module.locals.add(ValType::I32);
+                local.args.push(low);
+                local.args.push(high);
+                new_params.push(ValType::I32);
+                new_params.push(ValType::I32);
+                self.arguments.insert(arg, Replace { low, high });
+            }
+
+            if ty.results().len() > 1 {
+                bail!("multi-value returns not supported yet");
+            }
+            let prev = local.ty;
+            local.ty = if ty.results() == [ValType::I64] {
+                module.types.add(&new_params, &[ValType::I32])
+            } else {
+                let results = ty.results().to_vec();
+                module.types.add(&new_params, &results)
+            };
+            self.old_types_to_new.insert(prev, local.ty);
+        }
+
+        Ok(())
+    }
 }
 
 struct LowerI64<'a> {
@@ -118,6 +195,8 @@ struct LowerI64<'a> {
     replace_with: Option<ExprId>,
     id: ExprId,
     locals: &'a mut ModuleLocals,
+    blocks: IdHashMap<Expr, ValType>,
+    config: &'a ModuleConfig,
 }
 
 impl LowerI64<'_> {
@@ -128,6 +207,15 @@ impl LowerI64<'_> {
     fn replace_with(&mut self, id: ExprId) {
         assert!(self.replace_with.is_none());
         self.replace_with = Some(id);
+    }
+
+    /// Convenience function for creating locals with descriptive names
+    fn local(&mut self, ty: ValType, name: &str) -> LocalId {
+        let local = self.locals.add(ty);
+        if self.config.generate_names {
+            self.locals.get_mut(local).name = Some(format!("{}{}", name, local.index()));
+        }
+        return local;
     }
 }
 
@@ -146,8 +234,67 @@ impl VisitorMut for LowerI64<'_> {
         self.id = prev;
     }
 
+    fn visit_block_mut(&mut self, block: &mut Block) {
+        assert!(block.results.len() <= 1);
+        if let Some(ty) = block.results.get(0) {
+            self.blocks.insert(self.id, ty.clone());
+        }
+        block.visit_mut(self);
+        self.blocks.remove(&self.id);
+    }
+
+    fn visit_br_if_mut(&mut self, expr: &mut BrIf) {
+        expr.visit_mut(self);
+
+        if self.blocks.get(&expr.block.into()) != Some(&ValType::I64) {
+            return;
+        }
+
+        // Dealing with `br_if` is pretty difficult so just change it to a
+        // block with an if/else. We can hopefully clean this up in later
+        // passes. Note that we're careful to evaluate the argument first
+        // before the condition.
+        //
+        // We're translating this...
+        //
+        //  (br_if $block $value $condition)
+        //
+        // into...
+        //
+        //  (block (result i64)
+        //      (local.set $tmp $value)
+        //      (if $condition
+        //          (br $block (local.get $tmp))
+        //          (local.get $tmp)))
+        let local = self.local(ValType::I64, "br_if_val");
+        let set_local = self.func.local_set(local, expr.args[0]);
+        let get_local = self.func.local_get(local);
+        let br = self.func.br(expr.block, Box::new([get_local]));
+        let if_true = self.func.alloc(Block {
+            kind: BlockKind::Block,
+            params: Box::new([]),
+            results: Box::new([ValType::I64]),
+            exprs: vec![br],
+        });
+        let get_local = self.func.local_get(local);
+        let if_false = self.func.alloc(Block {
+            kind: BlockKind::Block,
+            params: Box::new([]),
+            results: Box::new([ValType::I64]),
+            exprs: vec![get_local],
+        });
+        let if_else = self.func.if_else(expr.condition, if_true, if_false);
+        let block = self.func.alloc(Block {
+            kind: BlockKind::Block,
+            params: Box::new([]),
+            results: Box::new([ValType::I64]),
+            exprs: vec![set_local, if_else],
+        });
+        self.replace_with(block.into());
+    }
+
     fn visit_unop_mut(&mut self, expr: &mut Unop) {
-        self.visit_expr_id_mut(&mut expr.expr);
+        expr.visit_mut(self);
 
         match expr.op {
             // Replace *64.reinterpret_*64 with a memory load/store through
@@ -293,6 +440,15 @@ struct RemoveI64<'a> {
 }
 
 impl RemoveI64<'_> {
+    /// Convenience function for creating locals with descriptive names
+    fn local(&mut self, ty: ValType, name: &str) -> LocalId {
+        let local = self.locals.add(ty);
+        if self.config.generate_names {
+            self.locals.get_mut(local).name = Some(format!("{}{}", name, local.index()));
+        }
+        return local;
+    }
+
     /// Returns the two 32-bit locals used for the 64-bit local specified.
     ///
     /// If the `local` hasn't already been split then this function goes ahead
@@ -301,9 +457,16 @@ impl RemoveI64<'_> {
     /// The `local` specified must be of type `i64` and the two returned locals
     /// are of type `i32`
     fn local_halves(&mut self, local: LocalId) -> Replace<Local> {
+        // Check our local cache first to see if we've already split this local
         if let Some(pair) = self.local_halves.get(&local) {
             return *pair;
         }
+        // Next check if we've already split this local because it's a function
+        // argument
+        if let Some(pair) = self.analysis.arguments.get(&local) {
+            return *pair;
+        }
+        // ... otherwise actually split it and cache the results!
         let replace = Replace {
             low: self.locals.add(ValType::I32),
             high: self.locals.add(ValType::I32),
@@ -323,11 +486,7 @@ impl RemoveI64<'_> {
     /// Spill the expression `bits` into a 32-bit local, returning the
     /// `local.set` instruction as well as the local we spilled to.
     fn spill(&mut self, bits: ExprId) -> (ExprId, LocalId) {
-        let local = self.locals.add(ValType::I32);
-        if self.config.generate_names {
-            let idx = self.low_bits.len();
-            self.locals.get_mut(local).name = Some(format!("temp_low_{}", idx));
-        }
+        let local = self.local(ValType::I32, "temp_low");
         let local_set = self.func.local_set(local, bits);
         (local_set, local)
     }
@@ -378,13 +537,8 @@ impl RemoveI64<'_> {
 
     /// Replaces a 64-bit bitwise operation with two 32-bit components.
     fn binary_bitop(&mut self, expr: &mut Binop, op32: BinaryOp) {
-        let lhs_temp_high = self.locals.add(ValType::I32);
-        let rhs_temp_high = self.locals.add(ValType::I32);
-
-        if self.config.generate_names {
-            self.locals.get_mut(lhs_temp_high).name = Some(format!("lhs_temp_high"));
-            self.locals.get_mut(rhs_temp_high).name = Some(format!("rhs_temp_high"));
-        }
+        let lhs_temp_high = self.local(ValType::I32, "binop_lhs_high");
+        let rhs_temp_high = self.local(ValType::I32, "binop_rhs_high");
 
         let lhs_temp = self.func.local_set(lhs_temp_high, expr.lhs);
         let rhs_temp = self.func.local_set(rhs_temp_high, expr.rhs);
@@ -551,23 +705,100 @@ impl VisitorMut for RemoveI64<'_> {
     }
 
     fn visit_br_mut(&mut self, br: &mut Br) {
+        assert!(br.args.len() <= 1);
         br.visit_mut(self);
-        unimplemented!()
+        let expr = match br.args.get(0) {
+            Some(e) => *e,
+            None => return,
+        };
+        let low_bits = match self.low_bits.get(&expr) {
+            Some(local) => *local,
+            None => return,
+        };
+
+        // For branching with a 64-bit value our branch's expression has the
+        // high bits, which we want to keep, but the low bits need to make their
+        // way into the block's low bits which get loaded later. To that end
+        // we're replacing a branch with:
+        //
+        //  (block
+        //      (local.set $tmp $expr)
+        //      (local.set $block_low (local.get $expr_low))
+        //      (br (local.get $tmp)))
+
+        let block_low = self.low_bits[&br.block.into()];
+
+        let high_tmp = self.local(ValType::I32, "br_high");
+        let set_high = self.func.local_set(high_tmp, expr);
+        let get_low = self.func.local_get(low_bits);
+        let set_low = self.func.local_set(block_low, get_low);
+        br.args[0] = self.func.local_get(high_tmp);
+
+        let block = self.func.alloc(Block {
+            kind: BlockKind::Block,
+            params: Box::new([]),
+            results: Box::new([ValType::I32]),
+            exprs: vec![set_high, set_low, self.id],
+        });
+        self.replace_with(block.into());
     }
 
     fn visit_br_if_mut(&mut self, br_if: &mut BrIf) {
+        assert!(br_if.args.len() <= 1);
         br_if.visit_mut(self);
-        unimplemented!()
+        if let Some(arg) = br_if.args.get(0) {
+            assert!(self.low_bits.get(arg).is_none());
+        }
     }
 
-    fn visit_br_table_mut(&mut self, br_table: &mut BrTable) {
-        br_table.visit_mut(self);
+    fn visit_br_table_mut(&mut self, expr: &mut BrTable) {
+        assert!(expr.args.len() <= 1);
+        expr.visit_mut(self);
+
+        // hm...
+        //
+        // perhaps one global "low bits on exit" for all blocks? Blocks then
+        // immediately load that on exit and store it in another temp? Worried
+        // about clobbering...
+
+        // let expr = match expr.args.get(0) {
+        //     Some(e) => *e,
+        //     None => return,
+        // };
+        // let low_bits = match self.low_bits.get(&expr) {
+        //     Some(local) => *local,
+        //     None => return,
+        // };
         unimplemented!()
     }
 
     fn visit_if_else_mut(&mut self, expr: &mut IfElse) {
+        let results = &self.func.block(expr.consequent).results;
+        assert!(results.len() <= 1);
+        let returns_i64 = &results[..] == [ValType::I64];
         expr.visit_mut(self);
-        unimplemented!()
+
+        if !returns_i64 {
+            return;
+        }
+
+        let low_local = self.local(ValType::I32, "if_else_low");
+        let temp_high = self.local(ValType::I32, "if_else_high");
+
+        let func = &mut self.func;
+        let mut update = |block: BlockId, low: LocalId| {
+            let mut exprs = mem::replace(&mut func.block_mut(block).exprs, Vec::new());
+            let last = exprs.last_mut().unwrap();
+            *last = func.local_set(temp_high, *last);
+            let get_low = func.local_get(low);
+            exprs.push(func.local_set(low_local, get_low));
+            exprs.push(func.local_get(temp_high));
+            func.block_mut(block).exprs = exprs;
+        };
+
+        update(expr.consequent, self.low_bits[&expr.consequent.into()]);
+        update(expr.alternative, self.low_bits[&expr.alternative.into()]);
+        self.low_bits.insert(self.id, low_local);
     }
 
     fn visit_return_mut(&mut self, expr: &mut Return) {
@@ -639,7 +870,7 @@ impl VisitorMut for RemoveI64<'_> {
                 // We'll want to take the expression and unconditionally move
                 // them to the low bits. The upper 32-bits are the 31st bit of
                 // the low bits, broadcast to all bits (a signed shift right).
-                let local = self.locals.add(ValType::I32);
+                let local = self.local(ValType::I32, "extend");
                 let tee_low = self.func.local_tee(local, expr.expr);
                 let amt = self.func.const_(Value::I32(31));
                 let get_low = self.func.local_get(local);
@@ -649,7 +880,7 @@ impl VisitorMut for RemoveI64<'_> {
 
             UnaryOp::I64Extend32S => {
                 // Same as above, but our low bits are slightly different
-                let local = self.locals.add(ValType::I32);
+                let local = self.local(ValType::I32, "extend");
                 let low = self.low_bits[&expr.expr];
                 let load_low = self.func.local_get(low);
                 let drop_high = self.func.drop(expr.expr);
@@ -724,7 +955,7 @@ impl VisitorMut for RemoveI64<'_> {
                 // Note that the high bits are always zero as you can't have
                 // more than 2^32 bits.
 
-                let high = self.locals.add(ValType::I32);
+                let high = self.local(ValType::I32, "ctz");
                 let low = self.low_bits[&expr.expr];
 
                 let set_high = self.func.local_set(high, expr.expr);
@@ -763,7 +994,7 @@ impl VisitorMut for RemoveI64<'_> {
                 // Note that the high bits are always zero as you can't have
                 // more than 2^32 bits.
 
-                let high = self.locals.add(ValType::I32);
+                let high = self.local(ValType::I32, "clz");
                 let low = self.low_bits[&expr.expr];
 
                 let set_high = self.func.local_set(high, expr.expr);
@@ -777,7 +1008,6 @@ impl VisitorMut for RemoveI64<'_> {
                 let c32 = self.func.const_(Value::I32(32));
                 let if_true = self.func.binop(BinaryOp::I32Add, c32, clz_low);
 
-                let load_low = self.func.local_get(low);
                 let if_false = self.func.unop(UnaryOp::I32Clz, load_high);
                 let select = self.func.select(condition, if_true, if_false);
 
@@ -807,7 +1037,7 @@ impl VisitorMut for RemoveI64<'_> {
                 //          (i32.load (local.tee $tmp ($address))))
                 //      (i32.load offset=4 (local.get $tmp)))
 
-                let address_local = self.locals.add(ValType::I32);
+                let address_local = self.local(ValType::I32, "load_address");
                 let address = self.func.local_tee(address_local, expr.address);
 
                 let kind = LoadKind::I32 { atomic: false };
@@ -844,7 +1074,7 @@ impl VisitorMut for RemoveI64<'_> {
                 //      (i32.store offset=4 (local.tee $tmp ($address)) $high)
                 //      (i32.store (local.get $address) (local.get $low)))
 
-                let address_local = self.locals.add(ValType::I32);
+                let address_local = self.local(ValType::I32, "store_address");
                 let kind = StoreKind::I32 { atomic: false };
                 let arg = expr.arg.with_align(cmp::min(expr.arg.align, 4));
 
@@ -874,22 +1104,53 @@ impl VisitorMut for RemoveI64<'_> {
     }
 
     fn visit_block_mut(&mut self, block: &mut Block) {
-        block.visit_mut(self);
-
         if block.results.len() > 1 {
             panic!("unimplemented support for multi-result blocks");
         }
 
         // If a block has a result type of i64 then our transformation means
-        // it'll actually have a result type of i32, so make it so.
-        // Additionally we'll store that the local for our expression that
-        // contains the low bits is the same as the local for the last
-        // expression that contains the low bits.
-        if let Some(ValType::I64) = block.results.get(0) {
-            block.results[0] = ValType::I32;
-            let last = block.exprs.last().unwrap();
-            let local = self.low_bits[&last];
-            self.low_bits.insert(self.id, local);
+        // it'll actually have a result type of i32. We need to make sure that
+        // any branches to the block also fill in the right value though, so
+        // we'll need to allocate a temporary for the low bits up front and then
+        // fill it in at the end. Branches will fill in the low bits manually.
+        //
+        // Overall we're doing...
+        //
+        //  (block (result i32)
+        //      ...
+        //      (local.set $temp ($high_bits))
+        //      (local.set $block_low (local.get $low_bits))
+        //      (local.get $temp))
+        match block.results.get(0) {
+            Some(ValType::I64) => {}
+            _ => return block.visit_mut(self),
         }
+
+        let low_bits = self.local(ValType::I32, "block_low");
+        assert!(self.low_bits.insert(self.id, low_bits).is_none());
+
+        block.visit_mut(self);
+
+        block.results[0] = ValType::I32;
+        let high_temp = self.local(ValType::I32, "block_high");
+
+        let last = block.exprs.last_mut().unwrap();
+
+        // If the block doesn't actually end in a 64-bit expression, such as
+        // some unreachable value, then there won't be any low bits registered.
+        // In that case no dance is necessary so we can just keep going.
+        let get_low = match self.low_bits.get(last) {
+            Some(local) => self.func.local_get(*local),
+            None => return,
+        };
+
+        // Switch the last expression to `local.set $temp $expr`
+        *last = self.func.local_set(high_temp, *last);
+
+        // Push `local.set $block_low (local.get $expr_low)`
+        block.exprs.push(self.func.local_set(low_bits, get_low));
+
+        // Push `local.get $temp`
+        block.exprs.push(self.func.local_get(high_temp));
     }
 }

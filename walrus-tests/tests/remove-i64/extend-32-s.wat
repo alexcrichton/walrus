@@ -11,26 +11,26 @@
   (module
     (type (;0;) (func))
     (func $f0 (type 0)
-      (local $temp_low_0 i32) (local i32 $temp_low_1 i32)
+      (local $temp_low0 i32) (local $extend1 i32) (local $temp_low2 i32)
       block  ;; label = @1
         block (result i32)  ;; label = @2
           block (result i32)  ;; label = @3
             block (result i32)  ;; label = @4
               global.get 0
-              local.set $temp_low_0
+              local.set $temp_low0
               global.get 1
             end
             drop
-            local.get $temp_low_0
+            local.get $temp_low0
           end
-          local.tee 1
-          local.set $temp_low_1
-          local.get 1
+          local.tee $extend1
+          local.set $temp_low2
+          local.get $extend1
           i32.const 31
           i32.shr_s
         end
         global.set 3
-        local.get $temp_low_1
+        local.get $temp_low2
         global.set 2
       end)
     (global (;0;) (mut i32) (i32.const 0))

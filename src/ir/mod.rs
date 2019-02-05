@@ -242,6 +242,8 @@ pub enum Expr {
     },
 
     /// `br_if`
+    ///
+    /// Note that the `args` are evaluated first before the `condition`
     #[walrus(display_extra = display_br_if)]
     BrIf {
         /// The condition for when to branch.
@@ -264,6 +266,9 @@ pub enum Expr {
     },
 
     /// `br_table`
+    ///
+    /// Note that like `br_if` the arguments are evaluated before the `which`
+    /// expression is evaluated.
     #[walrus(display_extra = display_br_table)]
     BrTable {
         /// The table index of which block to branch to.

@@ -10,19 +10,19 @@
   (module
     (type (;0;) (func (param i32)))
     (func $f0 (type 0) (param $addr i32)
-      (local i32 $temp_low_0 i32)
+      (local $extend1 i32) (local $temp_low2 i32)
       block  ;; label = @1
         block (result i32)  ;; label = @2
           local.get $addr
           i32.load8_s
-          local.tee 1
-          local.set $temp_low_0
-          local.get 1
+          local.tee $extend1
+          local.set $temp_low2
+          local.get $extend1
           i32.const 31
           i32.shr_s
         end
         global.set 1
-        local.get $temp_low_0
+        local.get $temp_low2
         global.set 0
       end)
     (memory (;0;) 1)

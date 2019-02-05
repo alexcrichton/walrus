@@ -12,33 +12,33 @@
   (module
     (type (;0;) (func))
     (func $f0 (type 0)
-      (local $temp_low_0 i32) (local $temp_low_1 i32) (local $lhs_temp_high i32) (local $rhs_temp_high i32) (local $temp_low_2 i32)
+      (local $temp_low1 i32) (local $temp_low2 i32) (local $binop_lhs_high3 i32) (local $binop_rhs_high4 i32) (local $temp_low5 i32)
       block  ;; label = @1
         block (result i32)  ;; label = @2
           block (result i32)  ;; label = @3
             block (result i32)  ;; label = @4
               global.get 0
-              local.set $temp_low_0
+              local.set $temp_low1
               global.get 1
             end
-            local.set $lhs_temp_high
+            local.set $binop_lhs_high3
             block (result i32)  ;; label = @4
               global.get 2
-              local.set $temp_low_1
+              local.set $temp_low2
               global.get 3
             end
-            local.set $rhs_temp_high
-            local.get $temp_low_0
-            local.get $temp_low_1
+            local.set $binop_rhs_high4
+            local.get $temp_low1
+            local.get $temp_low2
             i32.xor
           end
-          local.set $temp_low_2
-          local.get $lhs_temp_high
-          local.get $rhs_temp_high
+          local.set $temp_low5
+          local.get $binop_lhs_high3
+          local.get $binop_rhs_high4
           i32.xor
         end
         global.set 1
-        local.get $temp_low_2
+        local.get $temp_low5
         global.set 0
       end)
     (global (;0;) (mut i32) (i32.const 0))

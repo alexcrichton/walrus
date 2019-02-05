@@ -66,6 +66,26 @@ impl ModuleExports {
         self.arena.iter().map(|(_, f)| f)
     }
 
+    /// Get an iterator of all exported globals
+    pub fn globals<'a>(&'a self) -> impl Iterator<Item = GlobalId> + 'a {
+        self.arena.iter().filter_map(|(_, e)| {
+            match e.item {
+                ExportItem::Global(g) => Some(g),
+                _ => None,
+            }
+        })
+    }
+
+    /// Get an iterator of all exported functions
+    pub fn funcs<'a>(&'a self) -> impl Iterator<Item = FunctionId> + 'a {
+        self.arena.iter().filter_map(|(_, e)| {
+            match e.item {
+                ExportItem::Function(g) => Some(g),
+                _ => None,
+            }
+        })
+    }
+
     /// Add a new export to this module
     pub fn add(&mut self, name: &str, item: impl Into<ExportItem>) -> ExportId {
         self.arena.alloc_with_id(|id| Export {

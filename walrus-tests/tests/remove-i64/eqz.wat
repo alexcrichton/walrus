@@ -10,14 +10,14 @@
   (module
     (type (;0;) (func))
     (func $f0 (type 0)
-      (local $temp_low_0 i32)
+      (local $temp_low0 i32)
       block (result i32)  ;; label = @1
         global.get 1
-        local.set $temp_low_0
+        local.set $temp_low0
         global.get 2
       end
       i32.eqz
-      local.get $temp_low_0
+      local.get $temp_low0
       i32.eqz
       i32.and
       global.set 0)

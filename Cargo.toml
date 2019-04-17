@@ -15,6 +15,7 @@ A library for performing WebAssembly transformations
 
 [dependencies]
 failure = "0.1.2"
+gimli = "0.17.0"
 id-arena = { version = "2.2.1", features = ['rayon'] }
 leb128 = "0.2.3"
 log = "0.4"

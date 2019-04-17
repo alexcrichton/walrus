@@ -2,6 +2,7 @@
 
 mod config;
 mod data;
+mod debug;
 mod elements;
 mod exports;
 mod functions;
@@ -99,6 +100,7 @@ impl Module {
         let mut indices = IndicesToIds::default();
         let mut function_section_size = None;
         let mut data_count = None;
+        let mut debug = Vec::new();
 
         while !parser.eof() {
             let section = parser.read()?;
@@ -178,14 +180,17 @@ impl Module {
                             .map_err(failure::Error::from)
                             .and_then(|r| ret.parse_name_section(r, &indices)),
                         _ => {
-                            log::debug!("parsing custom section `{}`", name);
                             let mut reader = section.get_binary_reader();
                             let len = reader.bytes_remaining();
                             let payload = reader.read_bytes(len)?;
-                            ret.custom.push(CustomSection {
-                                name: name.to_string(),
-                                value: payload.to_vec(),
-                            });
+                            if name.starts_with(".debug") {
+                                debug.push((name, payload));
+                            } else {
+                                ret.custom.push(CustomSection {
+                                    name: name.to_string(),
+                                    value: payload.to_vec(),
+                                });
+                            }
                             continue;
                         }
                     };
@@ -194,6 +199,10 @@ impl Module {
                     }
                 }
             }
+        }
+
+        if debug.len() > 0 {
+            ret.parse_debug_sections(&debug)?;
         }
 
         if function_section_size.is_some() {
